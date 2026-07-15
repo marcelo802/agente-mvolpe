@@ -49,22 +49,36 @@ Exceção — imediato, sem esperar o final:
 - Qualquer pergunta fora do escopo de coleta (pedido de parecer técnico definitivo, revisão contratual, negociação de valores)
 
 ESTILO DE MENSAGEM:
-- Mensagens curtas (formato WhatsApp), sem parágrafos longos.
-- Uma pergunta por vez.
-- Emojis com moderação, apenas se o cliente usar primeiro.
+- Seja extremamente breve. Frases curtas, direto ao ponto, sem rodeios nem explicações desnecessárias.
+- Uma pergunta por vez, uma frase por vez sempre que possível.
+- Nunca use emojis, em hipótese alguma, mesmo que o cliente use.
 
 Contato do escritório: marcelo@mvolpe.adv.br | (47) 99986-0723`;
 async function enviarMensagem(telefone, texto) {
   await zapi.post("/send-text", { phone: telefone, message: texto });
 }
 
-// Controle de espera: 40s após a última mensagem do cliente antes da IA responder.
-// Se o Dr. Marcelo responder manualmente (mensagem fromMe) dentro desse prazo, a IA não entra.
-const ESPERA_MS = 40 * 1000;
+// Regras de tempo:
+// - Primeira mensagem de uma conversa/retomada: aguarda 10s antes da IA responder
+//   (dá chance do Dr. Marcelo responder manualmente primeiro).
+// - Mensagens seguintes (dentro da mesma sessão ativa da IA): resposta instantânea.
+// - Se o Dr. Marcelo enviar qualquer mensagem manualmente (fromMe), a IA para de atuar
+//   nessa conversa e só volta a responder automaticamente depois de 30 minutos
+//   sem nenhuma nova interação manual dele.
+const ESPERA_PRIMEIRA_MS = 10 * 1000;
+const PAUSA_MARCELO_MS = 30 * 60 * 1000;
+
 const timers = new Map(); // telefone -> timeout handle
 const buffers = new Map(); // telefone -> array de mensagens ainda não respondidas pela IA
+const aguardandoPrimeira = new Map(); // telefone -> boolean (true = próxima resposta usa espera de 10s)
+const pausadoAte = new Map(); // telefone -> timestamp (ms) até quando a IA fica pausada
 
-function limparEspera(telefone) {
+function iaEstaPausada(telefone) {
+  const ate = pausadoAte.get(telefone);
+  return !!ate && Date.now() < ate;
+}
+
+function cancelarRespostaPendente(telefone) {
   const t = timers.get(telefone);
   if (t) {
     clearTimeout(t);
@@ -78,6 +92,7 @@ async function processarComIA(telefone) {
   const pendentes = buffers.get(telefone) || [];
   buffers.delete(telefone);
   if (pendentes.length === 0) return;
+  if (iaEstaPausada(telefone)) return; // Dr. Marcelo voltou a interagir enquanto esperava
 
   const textoConsolidado = pendentes.join("\n");
   adicionarMensagem(telefone, "user", textoConsolidado);
@@ -91,6 +106,7 @@ async function processarComIA(telefone) {
     const respostaTexto = resposta.content[0].text;
     adicionarMensagem(telefone, "assistant", respostaTexto);
     await enviarMensagem(telefone, respostaTexto);
+    aguardandoPrimeira.set(telefone, false); // próximas mensagens são instantâneas
   } catch (erro) {
     console.error("Erro ao chamar IA:", erro.message);
   }
@@ -104,24 +120,36 @@ app.post("/webhook", async (req, res) => {
     if (!telefone) return;
 
     // Mensagem enviada pelo próprio Dr. Marcelo (respondeu manualmente pelo celular):
-    // cancela a IA para essa conversa, ele assumiu o atendimento.
+    // cancela qualquer resposta pendente da IA e pausa o agente por 30 minutos.
     if (body.fromMe) {
-      limparEspera(telefone);
+      cancelarRespostaPendente(telefone);
+      pausadoAte.set(telefone, Date.now() + PAUSA_MARCELO_MS);
+      aguardandoPrimeira.set(telefone, true); // ao retomar, trata como "primeira mensagem" de novo
       return;
     }
 
     const texto = body?.text?.message || body?.message;
     if (!texto || typeof texto !== "string") return;
 
+    if (iaEstaPausada(telefone)) return; // Dr. Marcelo assumiu a conversa recentemente
+
     // Acumula a mensagem do cliente no buffer da conversa.
     if (!buffers.has(telefone)) buffers.set(telefone, []);
     buffers.get(telefone).push(texto);
 
-    // Reinicia a contagem de 40s a cada nova mensagem do cliente.
+    const ehPrimeira = aguardandoPrimeira.get(telefone) !== false; // default true
+    const espera = ehPrimeira ? ESPERA_PRIMEIRA_MS : 0;
+
     const timerAnterior = timers.get(telefone);
     if (timerAnterior) clearTimeout(timerAnterior);
-    const novoTimer = setTimeout(() => processarComIA(telefone), ESPERA_MS);
-    timers.set(telefone, novoTimer);
+
+    if (espera === 0) {
+      // Resposta instantânea: processa direto, sem agendar timeout.
+      processarComIA(telefone);
+    } else {
+      const novoTimer = setTimeout(() => processarComIA(telefone), espera);
+      timers.set(telefone, novoTimer);
+    }
   } catch (erro) {
     console.error("Erro:", erro.message);
   }
