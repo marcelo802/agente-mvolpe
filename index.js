@@ -57,16 +57,31 @@ Contato do escritório: marcelo@mvolpe.adv.br | (47) 99986-0723`;
 async function enviarMensagem(telefone, texto) {
   await zapi.post("/send-text", { phone: telefone, message: texto });
 }
-app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+
+// Controle de espera: 40s após a última mensagem do cliente antes da IA responder.
+// Se o Dr. Marcelo responder manualmente (mensagem fromMe) dentro desse prazo, a IA não entra.
+const ESPERA_MS = 40 * 1000;
+const timers = new Map(); // telefone -> timeout handle
+const buffers = new Map(); // telefone -> array de mensagens ainda não respondidas pela IA
+
+function limparEspera(telefone) {
+  const t = timers.get(telefone);
+  if (t) {
+    clearTimeout(t);
+    timers.delete(telefone);
+  }
+  buffers.delete(telefone);
+}
+
+async function processarComIA(telefone) {
+  timers.delete(telefone);
+  const pendentes = buffers.get(telefone) || [];
+  buffers.delete(telefone);
+  if (pendentes.length === 0) return;
+
+  const textoConsolidado = pendentes.join("\n");
+  adicionarMensagem(telefone, "user", textoConsolidado);
   try {
-    const body = req.body;
-    if (body.fromMe) return;
-    const texto = body?.text?.message || body?.message;
-    if (!texto || typeof texto !== "string") return;
-    const telefone = body.phone;
-    if (!telefone) return;
-    adicionarMensagem(telefone, "user", texto);
     const resposta = await claude.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 1024,
@@ -76,6 +91,37 @@ app.post("/webhook", async (req, res) => {
     const respostaTexto = resposta.content[0].text;
     adicionarMensagem(telefone, "assistant", respostaTexto);
     await enviarMensagem(telefone, respostaTexto);
+  } catch (erro) {
+    console.error("Erro ao chamar IA:", erro.message);
+  }
+}
+
+app.post("/webhook", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const body = req.body;
+    const telefone = body.phone;
+    if (!telefone) return;
+
+    // Mensagem enviada pelo próprio Dr. Marcelo (respondeu manualmente pelo celular):
+    // cancela a IA para essa conversa, ele assumiu o atendimento.
+    if (body.fromMe) {
+      limparEspera(telefone);
+      return;
+    }
+
+    const texto = body?.text?.message || body?.message;
+    if (!texto || typeof texto !== "string") return;
+
+    // Acumula a mensagem do cliente no buffer da conversa.
+    if (!buffers.has(telefone)) buffers.set(telefone, []);
+    buffers.get(telefone).push(texto);
+
+    // Reinicia a contagem de 40s a cada nova mensagem do cliente.
+    const timerAnterior = timers.get(telefone);
+    if (timerAnterior) clearTimeout(timerAnterior);
+    const novoTimer = setTimeout(() => processarComIA(telefone), ESPERA_MS);
+    timers.set(telefone, novoTimer);
   } catch (erro) {
     console.error("Erro:", erro.message);
   }
