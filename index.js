@@ -69,7 +69,7 @@ async function enviarMensagem(telefone, texto) {
 // - Se o Dr. Marcelo enviar qualquer mensagem manualmente (fromMe), a IA para de atuar
 //   nessa conversa e só volta a responder automaticamente depois de 60 minutos
 //   sem nenhuma nova interação manual dele.
-const ESPERA_PRIMEIRA_MS = 25 * 1000;
+const ESPERA_PRIMEIRA_MS = 120 * 1000;
 const PAUSA_MARCELO_MS = 60 * 60 * 1000;
 
 const timers = new Map(); // telefone -> timeout handle
